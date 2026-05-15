@@ -19,7 +19,7 @@ Architecture (v3):
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 
 import gspread
 import pandas as pd
@@ -110,6 +110,7 @@ def _init_state():
         "last_save_time": None,
         # Analytics cache
         "analytics_summaries": None,
+        "kingy_cache": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -186,6 +187,22 @@ def append_row_gspread(worksheet_name: str, row_dict: dict):
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
+def append_rows_gspread(worksheet_name: str, rows_list: list):
+    """Append many rows at once with a single API call.
+    rows_list: list of dicts, each with keys matching COLS[worksheet_name].
+    Empty list = no-op.
+    """
+    if not rows_list:
+        return
+    ws = _get_worksheet(worksheet_name)
+    cols = COLS[worksheet_name]
+    rows_as_lists = [
+        [str(r.get(c, "")) for c in cols]
+        for r in rows_list
+    ]
+    ws.append_rows(rows_as_lists, value_input_option="USER_ENTERED")
+
+
 def update_cell_gspread(worksheet_name: str, match_id: str, target_col: str, new_value: str, key_col: str = "match_id"):
     """Find a row by key_col=match_id and update one cell.
     Used for end_time, status changes, etc.
@@ -247,6 +264,7 @@ def force_refresh_reads():
         pass
     st.session_state.cached_players = None
     st.session_state.analytics_summaries = None
+    st.session_state.kingy_cache = None
 
 
 # ============================================================
@@ -506,8 +524,42 @@ def action_end_match():
 
     # Clear game state
     st.session_state.game = None
-    st.session_state.analytics_summaries = None  # force reload next time
+    st.session_state.analytics_summaries = None
+    st.session_state.kingy_cache = None  # invalidate kingy cache
     return champion
+
+
+# ============================================================
+# KINGY — latest Champion of Champions lookup
+# ============================================================
+def get_latest_champion() -> str | None:
+    if st.session_state.kingy_cache is not None:
+        return st.session_state.kingy_cache
+    try:
+        champions_df = read_ws(CHAMPIONS_WS)
+        matches_df = read_ws(MATCHES_WS)
+        if champions_df.empty or matches_df.empty:
+            st.session_state.kingy_cache = ""
+            return None
+        completed = matches_df[matches_df["status"] == "Completed"].copy()
+        if completed.empty:
+            st.session_state.kingy_cache = ""
+            return None
+        completed["end_time_dt"] = pd.to_datetime(completed["end_time"], errors="coerce")
+        completed = completed.dropna(subset=["end_time_dt"])
+        if completed.empty:
+            st.session_state.kingy_cache = ""
+            return None
+        latest_match_id = completed.sort_values("end_time_dt", ascending=False).iloc[0]["match_id"]
+        row = champions_df[champions_df["match_id"] == latest_match_id]
+        if row.empty:
+            st.session_state.kingy_cache = ""
+            return None
+        name = str(row.iloc[0]["player_name"])
+        st.session_state.kingy_cache = name
+        return name
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -609,6 +661,17 @@ def recompute_summaries_from_raw():
 # HEADER + AUTH BAR
 # ============================================================
 st.title("🃏 DURAK System")
+
+_kingy = get_latest_champion()
+if _kingy:
+    st.markdown(
+        f"""<div style="text-align:center;background:#fff8e1;border:1px solid #f0c040;
+        border-radius:10px;padding:8px 16px;margin-bottom:4px;">
+        <span style="font-size:1.5em;color:#d4a017;font-weight:bold;">👑 KINGY: {_kingy}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
 st.caption("מערכת ניהול טורנירי דורק")
 
 top_col1, top_col2, top_col3 = st.columns([2, 2, 2])
@@ -652,7 +715,7 @@ if st.session_state.last_save_msg and st.session_state.last_save_time:
 
 st.divider()
 
-tab_mgmt, tab_live, tab_analytics = st.tabs(["⚙️ ניהול", "🎮 משחק פעיל", "📊 אנליזה"])
+tab_mgmt, tab_live, tab_analytics, tab_manual = st.tabs(["⚙️ ניהול", "🎮 משחק פעיל", "📊 אנליזה", "✍️ הזנה ידנית"])
 
 
 # ============================================================
@@ -1004,3 +1067,252 @@ with tab_analytics:
                 )])
                 fig_crowns_pie.update_layout(title_text="חלוקת כתרים (לכל הזמנים)")
                 st.plotly_chart(fig_crowns_pie, use_container_width=True)
+
+
+# ============================================================
+# TAB 4 — MANUAL HISTORICAL ENTRY
+# ============================================================
+with tab_manual:
+    st.header("✍️ הזנה ידנית של ערב משחק")
+    st.caption("מילוי מהיר לערב שנרשם על דף. כל סיבוב = שורה אחת. סה״כ קליקים מינימלי.")
+
+    if not is_keeper():
+        st.info("🔒 זמין לרשם בלבד.")
+        st.stop()
+
+    # Lazy load players
+    if st.session_state.cached_players is None:
+        _df_p = read_ws(PLAYERS_WS)
+        st.session_state.cached_players = (
+            _df_p["player_name"].dropna().astype(str).str.strip().tolist()
+            if not _df_p.empty and "player_name" in _df_p.columns
+            else []
+        )
+
+    # Step 1 — Date and participants
+    manual_date = st.date_input("תאריך הערב", value=datetime.today().date(), key="manual_date")
+    manual_participants = st.multiselect(
+        "משתתפים",
+        options=st.session_state.cached_players,
+        key="manual_participants",
+    )
+
+    if len(manual_participants) < 2:
+        st.info("בחר לפחות 2 משתתפים להמשך.")
+        st.stop()
+
+    # Step 2 — Number of rounds
+    manual_num_rounds = int(st.number_input(
+        "כמה סיבובים היו בערב?",
+        min_value=1, max_value=50, value=1, step=1,
+        key="manual_num_rounds",
+    ))
+
+    # Cleanup orphaned session_state keys for rounds beyond current
+    _keys_to_delete = [
+        k for k in list(st.session_state.keys())
+        if k.startswith("manual_r")
+        and any(
+            k.startswith(f"manual_r{i}_p") or k == f"manual_tiebreak_r{i}"
+            for i in range(manual_num_rounds + 1, 51)
+        )
+    ]
+    for _k in _keys_to_delete:
+        del st.session_state[_k]
+
+    # Step 3 — Round-by-round entry
+    st.subheader("סיבובים")
+    round_losers = {}  # i -> loser name
+    round_counts = {}  # i -> {player: count}
+
+    for i in range(1, manual_num_rounds + 1):
+        with st.expander(f"סיבוב {i}", expanded=(i == 1)):
+            counts_this_round = {}
+            for p in manual_participants:
+                val = st.number_input(
+                    p,
+                    min_value=0, max_value=5, value=0, step=1,
+                    key=f"manual_r{i}_p{p}",
+                )
+                counts_this_round[p] = int(val)
+            round_counts[i] = counts_this_round
+
+            total_in_round = sum(counts_this_round.values())
+            if total_in_round == 0:
+                st.warning(f"סיבוב {i}: עדיין לא הוזנו הפסדים.")
+            else:
+                max_count = max(counts_this_round.values())
+                tied = [p for p, c in counts_this_round.items() if c == max_count]
+                if len(tied) == 1:
+                    round_losers[i] = tied[0]
+                    st.caption(f"💀 מפסיד הסיבוב: {tied[0]}")
+                else:
+                    # Check for stale tiebreak selection
+                    stale_key = f"manual_tiebreak_r{i}"
+                    if st.session_state.get(stale_key) not in tied:
+                        if stale_key in st.session_state:
+                            del st.session_state[stale_key]
+                    tie_pick = st.selectbox(
+                        "מפסיד הסיבוב (תיקו):",
+                        options=tied,
+                        key=f"manual_tiebreak_r{i}",
+                    )
+                    round_losers[i] = tie_pick
+
+    # Step 4 — Champion
+    manual_champion = st.selectbox(
+        "👑 אלוף האלופים (מי הפסיד אחרון בערב?)",
+        options=manual_participants,
+        key="manual_champion",
+    )
+
+    # Step 5 — Validate + Save
+    validation_errors = []
+    if len(manual_participants) < 2:
+        validation_errors.append("יש לבחור לפחות 2 משתתפים.")
+    if manual_num_rounds < 1:
+        validation_errors.append("חייב להיות לפחות סיבוב אחד.")
+    for i in range(1, manual_num_rounds + 1):
+        if sum(round_counts.get(i, {}).values()) == 0:
+            validation_errors.append(f"סיבוב {i}: לא הוזנו הפסדים.")
+        if i not in round_losers:
+            validation_errors.append(f"סיבוב {i}: יש לבחור מפסיד בתיקו.")
+    if manual_champion not in manual_participants:
+        validation_errors.append("אלוף האלופים חייב להיות מהמשתתפים.")
+
+    if validation_errors:
+        st.error("\n".join(f"• {e}" for e in validation_errors))
+
+    save_clicked = st.button(
+        "💾 שמור את הערב כולו",
+        type="primary",
+        key="manual_save",
+        disabled=bool(validation_errors),
+    )
+
+    if save_clicked and not validation_errors:
+        date_str = manual_date.strftime("%Y-%m-%d")
+        match_id = f"M-{date_str.replace('-', '')}-{uuid.uuid4().hex[:6]}-MANUAL"
+        base_dt = datetime.combine(manual_date, time(20, 0))
+        from datetime import timedelta
+        ts_counter = [0]
+
+        def _next_ts():
+            ts_counter[0] += 5
+            return (base_dt + timedelta(seconds=ts_counter[0])).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Pre-compute summary data
+        losses_per = {}
+        crowns_per = {}
+        for i in range(1, manual_num_rounds + 1):
+            loser_i = round_losers[i]
+            crowns_per[loser_i] = crowns_per.get(loser_i, 0) + 1
+            for p, c in round_counts[i].items():
+                losses_per[p] = losses_per.get(p, 0) + c
+
+        total_losses_count = sum(losses_per.values())
+
+        # Compute end_time: last loss ts + 60s
+        total_loss_rows = sum(round_counts[i][p] for i in range(1, manual_num_rounds + 1) for p in manual_participants)
+        end_ts_offset = total_loss_rows * 5 + 60
+        end_time_str = (base_dt + timedelta(seconds=end_ts_offset)).strftime("%Y-%m-%d %H:%M:%S")
+        start_time_str = base_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Build all rows in memory
+        match_row = {
+            "match_id": match_id,
+            "date": date_str,
+            "start_time": start_time_str,
+            "end_time": end_time_str,
+            "status": "Completed",
+        }
+
+        setup_row = {
+            "round_id": f"R-{match_id}-SETUP",
+            "match_id": match_id,
+            "round_number": 0,
+            "status": "Setup",
+            "loser_name": ",".join(manual_participants),
+            "end_type": "",
+        }
+        round_rows = []
+        for i in range(1, manual_num_rounds + 1):
+            round_rows.append({
+                "round_id": f"R-{match_id}-{i}",
+                "match_id": match_id,
+                "round_number": i,
+                "status": "Completed",
+                "loser_name": round_losers[i],
+                "end_type": "Manual",
+            })
+
+        all_loss_rows = []
+        for i in range(1, manual_num_rounds + 1):
+            for p in manual_participants:
+                loss_count = round_counts[i].get(p, 0)
+                for nth in range(1, loss_count + 1):
+                    ts = _next_ts()
+                    all_loss_rows.append({
+                        "loss_id": f"L-{match_id}-R{i}-{p[:3]}-{nth}",
+                        "match_id": match_id,
+                        "round_number": i,
+                        "player_name": p,
+                        "loss_timestamp": ts,
+                        "loss_count_in_round": nth,
+                    })
+
+        champion_row = {
+            "match_id": match_id,
+            "player_name": manual_champion,
+            "title": "Champion of Champions",
+        }
+
+        top_crown = max(crowns_per, key=lambda k: crowns_per[k]) if crowns_per else None
+        summary_dict = {
+            "losses_per_player": losses_per,
+            "crowns_per_player": crowns_per,
+            "top_crown_player": top_crown,
+            "champion": manual_champion,
+            "total_losses": total_losses_count,
+            "total_rounds": manual_num_rounds,
+            "participants": manual_participants,
+        }
+        summary_row = {
+            "match_id": match_id,
+            "date": date_str,
+            "summary_json": json.dumps(summary_dict, ensure_ascii=False),
+        }
+
+        # Execute 5 batched API calls
+        current_step = "match_nights"
+        try:
+            append_rows_gspread(MATCHES_WS, [match_row])
+
+            current_step = "rounds"
+            append_rows_gspread(ROUNDS_WS, [setup_row, *round_rows])
+
+            current_step = "losses"
+            append_rows_gspread(LOSSES_WS, all_loss_rows)
+
+            current_step = "champions"
+            append_rows_gspread(CHAMPIONS_WS, [champion_row])
+
+            current_step = "match_summary"
+            append_rows_gspread(SUMMARY_WS, [summary_row])
+
+            st.success(f"✅ הערב נשמר. {manual_num_rounds} סיבובים, {total_losses_count} הפסדים. אלוף: {manual_champion}")
+            force_refresh_reads()
+            mark_saved("ערב היסטורי נשמר")
+
+        except Exception as e:
+            st.error(
+                f"שגיאה בשלב '{current_step}': {e}\n\n"
+                f"כתיבה חלקית — ייתכן שיהיה צורך לנקות ידנית בגיליון. match_id: {match_id}"
+            )
+
+    if st.button("➕ הזן ערב נוסף", key="manual_new_entry"):
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("manual_"):
+                del st.session_state[_k]
+        st.rerun()
+
