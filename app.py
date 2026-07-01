@@ -18,6 +18,7 @@ Architecture (v3):
 """
 
 import json
+import base64
 import uuid
 from datetime import datetime, time
 
@@ -659,12 +660,39 @@ def recompute_summaries_from_raw():
 
 
 # ============================================================
+# AUDIO HELPER — base64-embed MP3 for Streamlit Cloud compat
+# ============================================================
+def get_audio_base64(file_path: str) -> str | None:
+    try:
+        with open(file_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except FileNotFoundError:
+        return None
+
+
+# ============================================================
 # HEADER + AUTH BAR
 # ============================================================
 st.title("🃏 DURAK System")
 
 _kingy = get_latest_champion()
 if _kingy:
+    _audio_b64 = get_audio_base64("static/kingy-fanfare.mp3")
+    if _audio_b64:
+        _audio_tag = f'<audio id="kingy-audio" src="data:audio/mpeg;base64,{_audio_b64}" preload="auto"></audio>'
+        _audio_js = """
+      var audio = document.getElementById('kingy-audio');
+      if (!banner || !audio) return;
+      banner.addEventListener('mouseenter', function() {
+        try {
+          audio.currentTime = 0;
+          audio.play();
+        } catch(e) {}
+      });"""
+    else:
+        _audio_tag = "<!-- kingy-fanfare.mp3 not found, audio skipped -->"
+        _audio_js  = "/* audio file not found */"
+
     _kingy_html = f"""
     <style>
       body {{ margin:0; padding:0; background:transparent; }}
@@ -674,23 +702,14 @@ if _kingy:
       }}
       #kingy-banner span {{ font-size:1.5em; color:#d4a017; font-weight:bold; }}
     </style>
-    <audio id="kingy-audio" src="/app/static/kingy-fanfare.mp3" preload="auto"></audio>
+    {_audio_tag}
     <div id="kingy-banner">
       <span>👑 KINGY: {_kingy}</span>
     </div>
     <script>
     (function() {{
       var banner = document.getElementById('kingy-banner');
-      var audio  = document.getElementById('kingy-audio');
-      if (!banner || !audio) return;
-      banner.addEventListener('mouseenter', function() {{
-        try {{
-          if (audio.readyState >= 2) {{
-            audio.currentTime = 0;
-            audio.play();
-          }}
-        }} catch(e) {{}}
-      }});
+      {_audio_js}
     }})();
     </script>
     """
