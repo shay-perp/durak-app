@@ -1,3 +1,1 @@
-[server]
-enableStaticServing = true
-
+# Streamlit configuration
