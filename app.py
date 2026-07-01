@@ -25,6 +25,7 @@ import gspread
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from google.oauth2.service_account import Credentials
 from streamlit_gsheets import GSheetsConnection
 
@@ -32,7 +33,7 @@ from streamlit_gsheets import GSheetsConnection
 # CONFIGURATION
 # ============================================================
 # 🔐 סיסמת הרשם — שנה אותה
-SCOREKEEPER_PASSWORD = st.secrets["app"]["scorekeeper_password"]
+SCOREKEEPER_PASSWORD = "thesapar"
 
 # Worksheet names
 PLAYERS_WS = "players"
@@ -664,13 +665,36 @@ st.title("🃏 DURAK System")
 
 _kingy = get_latest_champion()
 if _kingy:
-    st.markdown(
-        f"""<div style="text-align:center;background:#fff8e1;border:1px solid #f0c040;
-        border-radius:10px;padding:8px 16px;margin-bottom:4px;">
-        <span style="font-size:1.5em;color:#d4a017;font-weight:bold;">👑 KINGY: {_kingy}</span>
-        </div>""",
-        unsafe_allow_html=True,
-    )
+    _kingy_html = f"""
+    <style>
+      body {{ margin:0; padding:0; background:transparent; }}
+      #kingy-banner {{
+        text-align:center; background:#fff8e1; border:1px solid #f0c040;
+        border-radius:10px; padding:8px 16px; margin:0; cursor:default;
+      }}
+      #kingy-banner span {{ font-size:1.5em; color:#d4a017; font-weight:bold; }}
+    </style>
+    <audio id="kingy-audio" src="/app/static/kingy-fanfare.mp3" preload="auto"></audio>
+    <div id="kingy-banner">
+      <span>👑 KINGY: {_kingy}</span>
+    </div>
+    <script>
+    (function() {{
+      var banner = document.getElementById('kingy-banner');
+      var audio  = document.getElementById('kingy-audio');
+      if (!banner || !audio) return;
+      banner.addEventListener('mouseenter', function() {{
+        try {{
+          if (audio.readyState >= 2) {{
+            audio.currentTime = 0;
+            audio.play();
+          }}
+        }} catch(e) {{}}
+      }});
+    }})();
+    </script>
+    """
+    components.html(_kingy_html, height=60)
 
 st.caption("מערכת ניהול טורנירי דורק")
 
